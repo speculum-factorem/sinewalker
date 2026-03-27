@@ -1,0 +1,8 @@
+com/stivensigal/walking/storage/ModelStorage$ModelEntry.class
+com/stivensigal/walking/api/GenomeDTO.class
+com/stivensigal/walking/api/ModelController.class
+com/stivensigal/walking/api/ModelController$ModelGetResponse.class
+com/stivensigal/walking/api/ModelController$ModelCreateResponse.class
+com/stivensigal/walking/api/ModelController$ModelCreateRequest.class
+com/stivensigal/walking/storage/ModelStorage.class
+com/stivensigal/walking/WalkingSoftbodyBackendApplication.class
