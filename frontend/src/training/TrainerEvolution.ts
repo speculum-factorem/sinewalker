@@ -7,6 +7,7 @@ export interface EvolutionConfig {
   mutationSigmaAmplitude?: number
   mutationSigmaOmega?: number
   mutationSigmaPhase?: number
+  useSuccessiveHalving?: boolean
 }
 
 export interface TrainerResult {
@@ -19,6 +20,14 @@ export interface GenerationSummary {
   generationCount: number
   bestRewardSoFar: number
   topRewardThisGen: number
+  bestGenomeThisGen: Genome
+}
+
+export interface EvaluationStage {
+  rolloutCount: number
+  stepRatio: number
+  minProgressScale: number
+  label: string
 }
 
 function clamp(x: number, min: number, max: number) {
@@ -60,7 +69,8 @@ export class TrainerEvolution {
       generations: config.generations ?? 20,
       mutationSigmaAmplitude: config.mutationSigmaAmplitude ?? 0.03,
       mutationSigmaOmega: config.mutationSigmaOmega ?? 0.4,
-      mutationSigmaPhase: config.mutationSigmaPhase ?? 0.6
+      mutationSigmaPhase: config.mutationSigmaPhase ?? 0.6,
+      useSuccessiveHalving: config.useSuccessiveHalving ?? true
     }
   }
 
@@ -102,11 +112,29 @@ export class TrainerEvolution {
     return this.sanitizeGenome({ amplitudes, omegas, phases })
   }
 
+  private crossover(parentA: Genome, parentB: Genome): Genome {
+    const n = parentA.amplitudes.length
+    const amplitudes: number[] = []
+    const omegas: number[] = []
+    const phases: number[] = []
+    for (let i = 0; i < n; i++) {
+      amplitudes.push(Math.random() < 0.5 ? parentA.amplitudes[i] : parentB.amplitudes[i])
+      omegas.push(Math.random() < 0.5 ? parentA.omegas[i] : parentB.omegas[i])
+      phases.push(Math.random() < 0.5 ? parentA.phases[i] : parentB.phases[i])
+    }
+    return this.sanitizeGenome({ amplitudes, omegas, phases })
+  }
+
   async run(
     actuatorCount: number,
-    evaluateGenome: (genome: Genome, individualIndex: number, generationIndex: number) => Promise<number>,
+    evaluateGenome: (
+      genome: Genome,
+      individualIndex: number,
+      generationIndex: number,
+      stage?: EvaluationStage
+    ) => Promise<number>,
     onLog?: (line: string) => void,
-    onGenerationEnd?: (summary: GenerationSummary) => void
+    onGenerationEnd?: (summary: GenerationSummary) => void | Promise<void>
   ): Promise<TrainerResult> {
     const { populationSize, eliteCount, generations } = this.config
 
@@ -126,14 +154,51 @@ export class TrainerEvolution {
 
     for (let g = 0; g < generations; g++) {
       const scored: Array<{ genome: Genome; reward: number }> = []
+      const rewardByIndex = new Map<number, number>()
 
       onLog?.(`Generation ${g + 1}/${generations}`)
 
+      if (this.config.useSuccessiveHalving) {
+        const stages: EvaluationStage[] = [
+          { rolloutCount: 1, stepRatio: 0.35, minProgressScale: 0.75, label: 'SH-1' },
+          { rolloutCount: 2, stepRatio: 0.65, minProgressScale: 0.9, label: 'SH-2' },
+          { rolloutCount: 3, stepRatio: 1.0, minProgressScale: 1.0, label: 'SH-3' }
+        ]
+        let candidates = population.map((genome, idx) => ({ genome: this.sanitizeGenome(genome), idx }))
+        const keepAfterStage = [
+          Math.max(this.config.eliteCount, Math.ceil(population.length * 0.5)),
+          Math.max(this.config.eliteCount, Math.ceil(population.length * 0.25))
+        ]
+
+        for (let s = 0; s < stages.length; s++) {
+          const stage = stages[s]
+          const stageScores: Array<{ genome: Genome; reward: number; idx: number }> = []
+          onLog?.(`  ${stage.label}: evaluating ${candidates.length}`)
+          for (const c of candidates) {
+            const reward = await evaluateGenome(c.genome, c.idx, g, stage)
+            stageScores.push({ genome: c.genome, reward, idx: c.idx })
+            rewardByIndex.set(c.idx, reward)
+          }
+          stageScores.sort((a, b) => b.reward - a.reward)
+          if (s < keepAfterStage.length) {
+            const keep = Math.min(stageScores.length, keepAfterStage[s])
+            candidates = stageScores.slice(0, keep).map((v) => ({ genome: v.genome, idx: v.idx }))
+          } else {
+            candidates = stageScores.map((v) => ({ genome: v.genome, idx: v.idx }))
+          }
+        }
+      } else {
+        for (let i = 0; i < population.length; i++) {
+          const genome = this.sanitizeGenome(population[i])
+          const reward = await evaluateGenome(genome, i, g)
+          rewardByIndex.set(i, reward)
+        }
+      }
+
       for (let i = 0; i < population.length; i++) {
         const genome = this.sanitizeGenome(population[i])
-        const reward = await evaluateGenome(genome, i, g)
+        const reward = rewardByIndex.get(i) ?? Number.NEGATIVE_INFINITY
         scored.push({ genome, reward })
-
         if (reward > bestReward) {
           bestReward = reward
           bestGenome = genome
@@ -145,19 +210,22 @@ export class TrainerEvolution {
 
       const elites = scored.slice(0, eliteCount).map((s) => s.genome)
       onLog?.(`  bestReward=${bestReward.toFixed(3)} topElite=${scored[0].reward.toFixed(3)}`)
-      onGenerationEnd?.({
+      await onGenerationEnd?.({
         generationIndex: g,
         generationCount: generations,
         bestRewardSoFar: bestReward,
-        topRewardThisGen: scored[0].reward
+        topRewardThisGen: scored[0].reward,
+        bestGenomeThisGen: scored[0].genome
       })
 
-      // Create next population: keep elites + mutate them.
+      // Create next population: keep elites + crossover/mutate their offspring.
       population = []
       for (let i = 0; i < eliteCount; i++) population.push(elites[i])
       while (population.length < populationSize) {
-        const parent = elites[Math.floor(Math.random() * elites.length)]
-        population.push(this.mutate(parent))
+        const parentA = elites[Math.floor(Math.random() * elites.length)]
+        const parentB = elites[Math.floor(Math.random() * elites.length)]
+        const child = this.crossover(parentA, parentB)
+        population.push(this.mutate(child))
       }
     }
 
@@ -165,4 +233,3 @@ export class TrainerEvolution {
     return { bestGenome, bestReward }
   }
 }
-

@@ -11,11 +11,12 @@ export function geometryPositionsFlat(geometry: THREE.BufferGeometry): number[] 
   return out
 }
 
-/** 4 точки «ножек» в локальных координатах геометрии (нормализованный стол). */
+/** Точки «ножек» в локальных координатах геометрии (любое количество). */
 export function computeFootPivotsLocal(geometry: THREE.BufferGeometry, count = 4): THREE.Vector3[] {
   geometry.computeBoundingBox()
   const pos = geometry.getAttribute('position')
   if (!pos) return []
+  const desired = Math.max(1, Math.floor(count))
 
   const n = pos.count
   const ys: number[] = []
@@ -23,24 +24,45 @@ export function computeFootPivotsLocal(geometry: THREE.BufferGeometry, count = 4
   ys.sort((a, b) => a - b)
   const yCut = ys[Math.floor(ys.length * 0.15)] ?? 0.12
 
-  const best: Array<{ x: number; y: number; z: number; score: number } | null> = [null, null, null, null]
+  const candidates: Array<{ p: THREE.Vector3; angle: number; score: number }> = []
 
   for (let i = 0; i < n; i++) {
     const y = pos.getY(i)
     if (y > yCut) continue
     const x = pos.getX(i)
     const z = pos.getZ(i)
-    const q = (x >= 0 ? 0 : 1) + (z >= 0 ? 0 : 2)
-    const score = Math.abs(x) + Math.abs(z) - y * 0.2
-    const cur = best[q]
-    if (!cur || score > cur.score) best[q] = { x, y, z, score }
+    const radial = Math.hypot(x, z)
+    if (radial < 1e-5) continue
+    const score = radial - y * 0.2
+    const angle = Math.atan2(z, x)
+    candidates.push({ p: new THREE.Vector3(x, y, z), angle, score })
+  }
+
+  if (candidates.length === 0) return []
+  const sectorSize = (Math.PI * 2) / desired
+  const bestBySector: Array<{ p: THREE.Vector3; score: number } | null> = new Array(desired).fill(null)
+  for (const c of candidates) {
+    const normalized = c.angle < 0 ? c.angle + Math.PI * 2 : c.angle
+    let sector = Math.floor(normalized / sectorSize)
+    if (sector >= desired) sector = desired - 1
+    const prev = bestBySector[sector]
+    if (!prev || c.score > prev.score) bestBySector[sector] = { p: c.p, score: c.score }
   }
 
   const out: THREE.Vector3[] = []
-  for (const b of best) {
-    if (b) out.push(new THREE.Vector3(b.x, b.y, b.z))
+  for (const b of bestBySector) {
+    if (b) out.push(b.p.clone())
   }
-  return out.slice(0, count)
+  if (out.length >= desired) return out.slice(0, desired)
+
+  // Fill missing sectors with next best unique points.
+  candidates.sort((a, b) => b.score - a.score)
+  for (const c of candidates) {
+    if (out.length >= desired) break
+    const tooClose = out.some((p) => p.distanceToSquared(c.p) < 1e-4)
+    if (!tooClose) out.push(c.p.clone())
+  }
+  return out
 }
 
 /** Ближайшие узлы soft body к заданным мировым точкам (разные индексы, где возможно). */

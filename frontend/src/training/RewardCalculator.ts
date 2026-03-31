@@ -5,6 +5,9 @@ export interface RewardConfig {
   fallMinY?: number
   fallPenalty?: number
   comAxis?: 'x' | 'z'
+  lateralPenaltyWeight?: number
+  backwardPenaltyWeight?: number
+  backtrackPenaltyWeight?: number
 }
 
 export interface EpisodeReward {
@@ -31,6 +34,9 @@ export class RewardCalculator {
   private readonly fallMinY: number
   private readonly fallPenalty: number
   private readonly comAxis: 'x' | 'z'
+  private readonly lateralPenaltyWeight: number
+  private readonly backwardPenaltyWeight: number
+  private readonly backtrackPenaltyWeight: number
 
   private comStart: THREE.Vector3 | null = null
   private comEnd: THREE.Vector3 | null = null
@@ -38,11 +44,18 @@ export class RewardCalculator {
 
   private minY = Infinity
   private nodeCount = 0
+  private lastAxisPos: number | null = null
+  private backwardTravel = 0
+  private maxAxisPos: number | null = null
+  private backtrackFromPeak = 0
 
   constructor(config: RewardConfig = {}) {
     this.fallMinY = config.fallMinY ?? 0.12
     this.fallPenalty = config.fallPenalty ?? 5
     this.comAxis = config.comAxis ?? 'x'
+    this.lateralPenaltyWeight = Math.max(0, config.lateralPenaltyWeight ?? 0.65)
+    this.backwardPenaltyWeight = Math.max(0, config.backwardPenaltyWeight ?? 2.4)
+    this.backtrackPenaltyWeight = Math.max(0, config.backtrackPenaltyWeight ?? 4.5)
   }
 
   start(softBody: any, nodeCount: number) {
@@ -51,6 +64,10 @@ export class RewardCalculator {
     this.minY = Infinity
 
     this.comStart = computeCOM(softBody, nodeCount)
+    this.lastAxisPos = this.comAxis === 'x' ? this.comStart.x : this.comStart.z
+    this.maxAxisPos = this.lastAxisPos
+    this.backwardTravel = 0
+    this.backtrackFromPeak = 0
     this.comEnd = null
   }
 
@@ -65,6 +82,19 @@ export class RewardCalculator {
       if (p.y() < this.minY) this.minY = p.y()
       if (p.y() < this.fallMinY) this.fell = true
     }
+    const com = computeCOM(softBody, this.nodeCount)
+    const axisPos = this.comAxis === 'x' ? com.x : com.z
+    if (this.lastAxisPos !== null) {
+      const delta = axisPos - this.lastAxisPos
+      if (delta < 0) this.backwardTravel += -delta
+    }
+    if (this.maxAxisPos === null) {
+      this.maxAxisPos = axisPos
+    } else {
+      this.maxAxisPos = Math.max(this.maxAxisPos, axisPos)
+      this.backtrackFromPeak = Math.max(this.backtrackFromPeak, this.maxAxisPos - axisPos)
+    }
+    this.lastAxisPos = axisPos
   }
 
   finish(softBody: any): EpisodeReward {
@@ -75,7 +105,13 @@ export class RewardCalculator {
     const end = this.comEnd
 
     const progress = this.comAxis === 'x' ? end.x - start.x : end.z - start.z
-    const reward = progress - (this.fell ? this.fallPenalty : 0)
+    const lateralDrift = this.comAxis === 'x' ? Math.abs(end.z - start.z) : Math.abs(end.x - start.x)
+    const reward =
+      progress -
+      this.lateralPenaltyWeight * lateralDrift -
+      this.backwardPenaltyWeight * this.backwardTravel -
+      this.backtrackPenaltyWeight * this.backtrackFromPeak -
+      (this.fell ? this.fallPenalty : 0)
 
     return {
       reward,
@@ -91,6 +127,10 @@ export class RewardCalculator {
     this.fell = false
     this.minY = Infinity
     this.comStart = comWorldFromRigidBody(body)
+    this.lastAxisPos = this.comAxis === 'x' ? this.comStart.x : this.comStart.z
+    this.maxAxisPos = this.lastAxisPos
+    this.backwardTravel = 0
+    this.backtrackFromPeak = 0
     this.comEnd = null
   }
 
@@ -98,6 +138,18 @@ export class RewardCalculator {
     const com = comWorldFromRigidBody(body)
     if (com.y < this.minY) this.minY = com.y
     if (com.y < this.fallMinY) this.fell = true
+    const axisPos = this.comAxis === 'x' ? com.x : com.z
+    if (this.lastAxisPos !== null) {
+      const delta = axisPos - this.lastAxisPos
+      if (delta < 0) this.backwardTravel += -delta
+    }
+    if (this.maxAxisPos === null) {
+      this.maxAxisPos = axisPos
+    } else {
+      this.maxAxisPos = Math.max(this.maxAxisPos, axisPos)
+      this.backtrackFromPeak = Math.max(this.backtrackFromPeak, this.maxAxisPos - axisPos)
+    }
+    this.lastAxisPos = axisPos
   }
 
   finishRigid(body: any): EpisodeReward {
@@ -108,7 +160,13 @@ export class RewardCalculator {
     const end = this.comEnd
 
     const progress = this.comAxis === 'x' ? end.x - start.x : end.z - start.z
-    const reward = progress - (this.fell ? this.fallPenalty : 0)
+    const lateralDrift = this.comAxis === 'x' ? Math.abs(end.z - start.z) : Math.abs(end.x - start.x)
+    const reward =
+      progress -
+      this.lateralPenaltyWeight * lateralDrift -
+      this.backwardPenaltyWeight * this.backwardTravel -
+      this.backtrackPenaltyWeight * this.backtrackFromPeak -
+      (this.fell ? this.fallPenalty : 0)
 
     return {
       reward,
