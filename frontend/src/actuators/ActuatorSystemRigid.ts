@@ -2,6 +2,7 @@ import * as THREE from 'three'
 import { AmmoWorld } from '../physics/AmmoWorld'
 import { comWorldFromRigidBody } from '../physics/rigidBodyThree'
 import type { Genome } from './ActuatorSystem'
+import type { MotorCommand, RobotState } from '../robotio/types'
 
 interface FootActuator {
   pivotBodyLocal: THREE.Vector3
@@ -131,21 +132,48 @@ export class ActuatorSystemRigid {
 
   applyAtTime(tSeconds: number) {
     if (!this.currentGenome || !this.tableBody) return
-    const { amplitudes, omegas, phases } = this.currentGenome
+    const state: RobotState = {
+      simTimeSeconds: tSeconds,
+      com: { x: 0, y: 0, z: 0 },
+      linearVelocity: { x: 0, y: 0, z: 0 }
+    }
+    const commands = this.computeMotorCommands(this.currentGenome, tSeconds, state)
+    this.applyMotorCommands(commands)
+  }
+
+  computeMotorCommands(genome: Genome, tSeconds: number, _state: RobotState): MotorCommand[] {
+    const { amplitudes, omegas, phases } = genome
+    const commands: MotorCommand[] = []
+    for (let i = 0; i < this.actuators.length; i++) {
+      const a = this.actuators[i]
+      const phase = omegas[i] * tSeconds + phases[i] + a.phaseBias
+      const signal = Math.sin(phase)
+      const signalVel = omegas[i] * Math.cos(phase)
+      commands.push({
+        jointId: `leg-${i}`,
+        index: i,
+        targetPosition: amplitudes[i] * signal,
+        targetVelocity: amplitudes[i] * signalVel,
+        targetEffort: amplitudes[i] * signal * this.springGain
+      })
+    }
+    return commands
+  }
+
+  applyMotorCommands(commands: MotorCommand[]) {
+    if (!this.tableBody) return
     const com = comWorldFromRigidBody(this.tableBody)
     const k = this.springGain
     const fCap = this.maxForcePerFoot
 
     for (let i = 0; i < this.actuators.length; i++) {
       const a = this.actuators[i]
+      const cmd = commands[i]
+      if (!cmd) continue
       const footWorld = this.bodyLocalToWorld(this.tableBody, a.pivotBodyLocal)
-      const offset = a.dir
-        .clone()
-        .multiplyScalar(amplitudes[i] * Math.sin(omegas[i] * tSeconds + phases[i] + a.phaseBias))
-
-      let fx = offset.x * k
-      let fy = offset.y * k
-      let fz = offset.z * k
+      let fx = a.dir.x * (cmd.targetEffort * k)
+      let fy = a.dir.y * (cmd.targetEffort * k)
+      let fz = a.dir.z * (cmd.targetEffort * k)
       const len = Math.hypot(fx, fy, fz)
       if (len > fCap && len > 1e-8) {
         const s = fCap / len
@@ -163,7 +191,7 @@ export class ActuatorSystemRigid {
       this.tableBody.applyForce(this.forceBt, this.relBt)
 
       // Маркеры двигаем всегда — при повторном показе позы не скачут.
-      const glued = footWorld.clone()
+      const glued = footWorld.clone().add(a.dir.clone().multiplyScalar(cmd.targetPosition))
       const gp = this.actuatorGroundPlane
       if (gp !== null && Number.isFinite(gp)) {
         const minCenterY = gp + a.radius + 0.004

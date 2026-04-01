@@ -1,0 +1,7 @@
+link:
+  protocol: ros2_control
+  heartbeat_timeout_sec: 0.8
+
+smoothing:
+  max_velocity_step: 2.5
+  max_acceleration_step: 14.0

@@ -12,6 +12,11 @@ export interface RigidBodyHandle {
   shape: any
 }
 
+export interface StaticBoxOptions {
+  friction?: number
+  restitution?: number
+}
+
 export class AmmoWorld {
   readonly ammo: AmmoType
   readonly physicsWorld: any
@@ -90,6 +95,40 @@ export class AmmoWorld {
     body.setFriction(1.0)
     try {
       body.setRestitution(0)
+    } catch {
+      // ignore
+    }
+
+    const ALL = -1
+    const DEFAULT_GROUP = 1
+    this.physicsWorld.addRigidBody(body, DEFAULT_GROUP, ALL)
+    this.rigidBodies.push(body)
+    return { body, shape }
+  }
+
+  createStaticBox(
+    halfExtentsVec: THREE.Vector3,
+    position: THREE.Vector3,
+    rotation = new THREE.Quaternion(),
+    options: StaticBoxOptions = {}
+  ): RigidBodyHandle {
+    const { ammo } = this
+    const halfExtents = this.own(new ammo.btVector3(halfExtentsVec.x, halfExtentsVec.y, halfExtentsVec.z))
+    const shape = this.own(new ammo.btBoxShape(halfExtents))
+    shape.setMargin(0.01)
+
+    const transform = this.own(new ammo.btTransform())
+    transform.setIdentity()
+    transform.setOrigin(this.own(new ammo.btVector3(position.x, position.y, position.z)))
+    transform.setRotation(this.own(new ammo.btQuaternion(rotation.x, rotation.y, rotation.z, rotation.w)))
+
+    const motionState = this.own(new ammo.btDefaultMotionState(transform))
+    const localInertia = this.own(new ammo.btVector3(0, 0, 0))
+    const rbInfo = this.own(new ammo.btRigidBodyConstructionInfo(0, motionState, shape, localInertia))
+    const body = this.own(new ammo.btRigidBody(rbInfo))
+    body.setFriction(options.friction ?? 1.0)
+    try {
+      body.setRestitution(options.restitution ?? 0.0)
     } catch {
       // ignore
     }

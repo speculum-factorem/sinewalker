@@ -5,7 +5,7 @@ import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometr
 import spiderObjRaw from './assets/models/spider3dmodel/TRANTULA/TRANTULA.OBJ?raw'
 import spiderObjUrl from './assets/models/spider3dmodel/TRANTULA/TRANTULA.OBJ?url'
 
-import { AmmoWorld } from './physics/AmmoWorld'
+import { AmmoWorld, type RigidBodyHandle } from './physics/AmmoWorld'
 import { computeFootPivotsLocal, geometryPositionsFlat } from './physics/geometryFeet'
 import {
   applyRigidBodyElasticityMaterial,
@@ -23,6 +23,8 @@ import { TrainerCmaEs } from './training/TrainerCmaEs'
 import { TrainerDe } from './training/TrainerDe'
 import { TrainerPso } from './training/TrainerPso'
 import { TrainerCem } from './training/TrainerCem'
+import { RobotIoLayer } from './robotio/RobotIoLayer'
+import type { MotorCommand, RobotBackendId } from './robotio/types'
 import {
   applyLegVertexFlex,
   footOutwardDirsXZ,
@@ -51,6 +53,7 @@ const TRAINING_BACKWARD_PENALTY_WEIGHT = 2.6
 const TRAINING_BACKTRACK_PENALTY_WEIGHT = 4.8
 
 type TrainingAlgorithmId = 'evolution' | 'cmaes' | 'de' | 'pso' | 'cem'
+type TerrainId = 'flat' | 'ice' | 'gravel' | 'slope' | 'steps' | 'rough'
 const GROUND_PLANE_Y = 0
 /** Ползунок и визуальный изгиб, и физика приводов; это значение = множитель 1.0 к базовой жёсткости. */
 const DEFAULT_ELASTICITY_SLIDER = 0.086
@@ -61,6 +64,48 @@ const ELASTICITY_MULT_MAX = 2.2
 
 const TABLE_RIGID_MASS = 14
 type FigureId = 'table' | 'stool' | 'bench' | 'spider' | 'turtle' | 'beetle' | 'crab' | 'rocket'
+const POLICY_FILE_VERSION = 1
+
+interface PolicySnapshot {
+  version: number
+  createdAt: string
+  algorithm: TrainingAlgorithmId
+  figure: FigureId
+  trainingGenerations: number
+  elasticitySlider: number
+  showActuatorSpheres: boolean
+  terrain: TerrainId
+  randomTerrainPerEpisode: boolean
+  robotBackend: RobotBackendId
+  robotWsUrl: string
+  genome: Genome
+}
+
+interface TerrainBodySpec {
+  halfExtents: THREE.Vector3
+  position: THREE.Vector3
+  rotation?: THREE.Quaternion
+  color: number
+}
+
+interface TerrainProfile {
+  id: TerrainId
+  label: string
+  friction: number
+  restitution: number
+  spawnYOffset: number
+  specs: TerrainBodySpec[]
+}
+
+interface TerrainBodyInstance {
+  handle: RigidBodyHandle
+  mesh: THREE.Mesh
+  activePosition: THREE.Vector3
+  activeRotation: THREE.Quaternion
+  hiddenPosition: THREE.Vector3
+}
+
+const TERRAIN_PHYSICS_DEBUG_MESHES = false
 
 function normalizeGeometry(geometry: THREE.BufferGeometry): THREE.BufferGeometry {
   const cloned = geometry.clone()
@@ -614,6 +659,100 @@ function actuatorCountForFigure(kind: FigureId): number {
   return 4
 }
 
+function terrainLabel(kind: TerrainId): string {
+  if (kind === 'ice') return 'Лед'
+  if (kind === 'gravel') return 'Гравий'
+  if (kind === 'slope') return 'Уклон'
+  if (kind === 'steps') return 'Ступеньки'
+  if (kind === 'rough') return 'Шумовой рельеф'
+  return 'Плоский'
+}
+
+function buildTerrainProfiles(): TerrainProfile[] {
+  const flat: TerrainProfile = {
+    id: 'flat',
+    label: 'Плоский',
+    friction: 1.0,
+    restitution: 0.0,
+    spawnYOffset: 0,
+    specs: [{ halfExtents: new THREE.Vector3(10, 1.5, 10), position: new THREE.Vector3(0, -1.5, 0), color: 0xffffff }]
+  }
+  const ice: TerrainProfile = {
+    id: 'ice',
+    label: 'Лед',
+    friction: 0.06,
+    restitution: 0.03,
+    spawnYOffset: 0,
+    specs: [{ halfExtents: new THREE.Vector3(10, 1.5, 10), position: new THREE.Vector3(0, -1.5, 0), color: 0xcdeeff }]
+  }
+  const gravel: TerrainProfile = {
+    id: 'gravel',
+    label: 'Гравий',
+    friction: 1.8,
+    restitution: 0.0,
+    spawnYOffset: 0.01,
+    specs: [{ halfExtents: new THREE.Vector3(10, 1.5, 10), position: new THREE.Vector3(0, -1.5, 0), color: 0xcec4b7 }]
+  }
+  const slopeAngle = THREE.MathUtils.degToRad(8)
+  const slopeQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), slopeAngle)
+  const slope: TerrainProfile = {
+    id: 'slope',
+    label: 'Уклон',
+    friction: 0.9,
+    restitution: 0.0,
+    spawnYOffset: 0.14,
+    specs: [
+      {
+        halfExtents: new THREE.Vector3(10, 1.5, 10),
+        position: new THREE.Vector3(0, -1.5, 0),
+        rotation: slopeQuat,
+        color: 0xf5e7cc
+      }
+    ]
+  }
+  const stepsSpecs: TerrainBodySpec[] = []
+  for (let i = 0; i < 9; i++) {
+    const x = -4 + i
+    const h = 0.05 + i * 0.04
+    stepsSpecs.push({
+      halfExtents: new THREE.Vector3(0.5, h, 6),
+      position: new THREE.Vector3(x, -h, 0),
+      color: 0xd9d9d9
+    })
+  }
+  const steps: TerrainProfile = {
+    id: 'steps',
+    label: 'Ступеньки',
+    friction: 1.1,
+    restitution: 0.0,
+    spawnYOffset: 0.05,
+    specs: stepsSpecs
+  }
+  const roughSpecs: TerrainBodySpec[] = []
+  const roughCountX = 8
+  const roughCountZ = 5
+  for (let ix = 0; ix < roughCountX; ix++) {
+    for (let iz = 0; iz < roughCountZ; iz++) {
+      const jitter = (Math.sin(ix * 2.31 + iz * 1.73) + Math.cos(ix * 1.17 - iz * 2.09)) * 0.5
+      const h = 0.22 + Math.max(0.02, (jitter + 1) * 0.14)
+      roughSpecs.push({
+        halfExtents: new THREE.Vector3(1.25, h, 1.25),
+        position: new THREE.Vector3((ix - (roughCountX - 1) * 0.5) * 2.5, -h, (iz - (roughCountZ - 1) * 0.5) * 2.5),
+        color: 0xbfc7cf
+      })
+    }
+  }
+  const rough: TerrainProfile = {
+    id: 'rough',
+    label: 'Шумовой рельеф',
+    friction: 1.0,
+    restitution: 0.0,
+    spawnYOffset: 0.11,
+    specs: roughSpecs
+  }
+  return [flat, ice, gravel, slope, steps, rough]
+}
+
 export function createWalkApp(root: HTMLDivElement) {
   root.innerHTML = `
     <div id="viewport"></div>
@@ -656,8 +795,47 @@ export function createWalkApp(root: HTMLDivElement) {
         <option value="pso">Particle Swarm Optimization (PSO)</option>
         <option value="cem">Cross-Entropy Method (CEM)</option>
       </select>
+      <label for="terrainType">Terrain Lab</label>
+      <select id="terrainType">
+        <option value="flat">Плоский</option>
+        <option value="ice">Лед</option>
+        <option value="gravel">Гравий</option>
+        <option value="slope">Уклон</option>
+        <option value="steps">Ступеньки</option>
+        <option value="rough">Шумовой рельеф</option>
+      </select>
+      <div class="row">
+        <label for="terrainRandomEpisodes">Случайно на эпизоде</label>
+        <input type="checkbox" id="terrainRandomEpisodes" />
+      </div>
+      <label for="robotBackend">Robot I/O backend</label>
+      <select id="robotBackend">
+        <option value="sim">sim backend</option>
+        <option value="hardware-websocket">hardware backend (WebSocket)</option>
+      </select>
+      <label for="robotWsUrl">Hardware endpoint</label>
+      <input type="text" id="robotWsUrl" value="ws://localhost:8765" />
+      <label>Calibration UI</label>
+      <div class="row">
+        <select id="calibJoint"></select>
+        <button type="button" id="identifyJoint">Identify</button>
+      </div>
+      <div class="row">
+        <button type="button" id="calibStepZero">Step 1: Zero offset</button>
+        <button type="button" id="calibStepDirection">Step 2: Direction</button>
+      </div>
+      <div class="row">
+        <button type="button" id="calibStepLimits">Step 3: Limits</button>
+        <button type="button" id="calibSaveYaml">Save calibrated YAML</button>
+      </div>
+      <canvas id="calibChart" width="300" height="84"></canvas>
       <div class="row">
         <button type="button" id="trainStart">Обучить политику</button>
+      </div>
+      <label>Политика (JSON)</label>
+      <div class="row">
+        <button type="button" id="policySave">Save JSON</button>
+        <button type="button" id="policyLoad">Load JSON</button>
       </div>
       <canvas id="rewardChart" width="300" height="80"></canvas>
       <div class="muted" id="status"></div>
@@ -675,6 +853,19 @@ export function createWalkApp(root: HTMLDivElement) {
   const simStartBtn = root.querySelector<HTMLButtonElement>('#simStart')
   const simStopBtn = root.querySelector<HTMLButtonElement>('#simStop')
   const trainStartBtn = root.querySelector<HTMLButtonElement>('#trainStart')
+  const calibJointEl = root.querySelector<HTMLSelectElement>('#calibJoint')
+  const identifyJointBtn = root.querySelector<HTMLButtonElement>('#identifyJoint')
+  const calibStepZeroBtn = root.querySelector<HTMLButtonElement>('#calibStepZero')
+  const calibStepDirectionBtn = root.querySelector<HTMLButtonElement>('#calibStepDirection')
+  const calibStepLimitsBtn = root.querySelector<HTMLButtonElement>('#calibStepLimits')
+  const calibSaveYamlBtn = root.querySelector<HTMLButtonElement>('#calibSaveYaml')
+  const calibChart = root.querySelector<HTMLCanvasElement>('#calibChart')
+  const terrainTypeEl = root.querySelector<HTMLSelectElement>('#terrainType')
+  const terrainRandomEpisodesEl = root.querySelector<HTMLInputElement>('#terrainRandomEpisodes')
+  const robotBackendEl = root.querySelector<HTMLSelectElement>('#robotBackend')
+  const robotWsUrlEl = root.querySelector<HTMLInputElement>('#robotWsUrl')
+  const policySaveBtn = root.querySelector<HTMLButtonElement>('#policySave')
+  const policyLoadBtn = root.querySelector<HTMLButtonElement>('#policyLoad')
   const trainGenerationsEl = root.querySelector<HTMLInputElement>('#trainGenerations')
   const trainAlgorithmEl = root.querySelector<HTMLSelectElement>('#trainAlgorithm')
 
@@ -690,6 +881,19 @@ export function createWalkApp(root: HTMLDivElement) {
     !simStartBtn ||
     !simStopBtn ||
     !trainStartBtn ||
+    !calibJointEl ||
+    !identifyJointBtn ||
+    !calibStepZeroBtn ||
+    !calibStepDirectionBtn ||
+    !calibStepLimitsBtn ||
+    !calibSaveYamlBtn ||
+    !calibChart ||
+    !terrainTypeEl ||
+    !terrainRandomEpisodesEl ||
+    !robotBackendEl ||
+    !robotWsUrlEl ||
+    !policySaveBtn ||
+    !policyLoadBtn ||
     !trainGenerationsEl ||
     !trainAlgorithmEl
   ) {
@@ -704,6 +908,9 @@ export function createWalkApp(root: HTMLDivElement) {
 
   let showActuatorSpheres = true
   let currentFigure: FigureId = 'table'
+  const terrainProfiles = buildTerrainProfiles()
+  let currentTerrain: TerrainId = 'flat'
+  let randomTerrainPerEpisode = false
 
   let simTimeSeconds = 0
   let isPlaying = false
@@ -765,9 +972,44 @@ export function createWalkApp(root: HTMLDivElement) {
   let tableRigidBody: any = null
   let tableVisualMesh: THREE.Mesh | null = null
   let actuatorSystem: ActuatorSystemRigid | null = null
+  const terrainVisualGroup = new THREE.Group()
+  const terrainDecorById = new Map<TerrainId, THREE.Group>()
+  const terrainBodiesById = new Map<TerrainId, TerrainBodyInstance[]>()
+  let terrainSpawnYOffset = 0
+  let robotIoLayer: RobotIoLayer | null = null
+  let calibCmdHistory: number[] = []
+  let calibMeasHistory: number[] = []
+  let identificationActive = false
+  let identificationJointIdx = 0
+  let identificationStartTime = 0
+  let calibrationYamlObject: {
+    generatedAt: string
+    robotBackend: RobotBackendId
+    robotWsUrl: string
+    joints: Array<{
+      input: string
+      output_name: string
+      output_id: number
+      sign: number
+      scale: number
+      position_offset: number
+      limits: {
+        position_min: number
+        position_max: number
+        velocity_abs_max: number
+        effort_abs_max: number
+      }
+    }>
+  } = {
+    generatedAt: new Date().toISOString(),
+    robotBackend: 'sim',
+    robotWsUrl: 'ws://localhost:8765',
+    joints: []
+  }
 
   const initialTablePos = new THREE.Vector3()
   const initialTableQuat = new THREE.Quaternion()
+  const resetPosePos = new THREE.Vector3()
   const initialScaleScratch = new THREE.Vector3()
   let tableResetPool: RigidBodyResetPool | null = null
 
@@ -785,10 +1027,17 @@ export function createWalkApp(root: HTMLDivElement) {
   let camera: THREE.PerspectiveCamera
   let renderer: THREE.WebGLRenderer
   let controls: any
+  let baseFloorMesh: THREE.Mesh | null = null
+  let baseGridHelper: THREE.GridHelper | null = null
 
   let meshGeometry: THREE.BufferGeometry | null = null
   let footPivotsLocal: THREE.Vector3[] = []
   let meshTransform = new THREE.Matrix4().makeTranslation(0, 0.55, 0)
+  const policyFileInput = document.createElement('input')
+  policyFileInput.type = 'file'
+  policyFileInput.accept = 'application/json,.json'
+  policyFileInput.style.display = 'none'
+  root.appendChild(policyFileInput)
 
   const parseSpiderObjGeometry = async () => {
     spiderObjLastError = ''
@@ -830,7 +1079,276 @@ export function createWalkApp(root: HTMLDivElement) {
     }
   }
 
+  const setStaticBodyPose = (body: any, pos: THREE.Vector3, rot: THREE.Quaternion) => {
+    if (!ammoWorld) return
+    const a = ammoWorld.ammo
+    const tr = new a.btTransform()
+    const origin = new a.btVector3(pos.x, pos.y, pos.z)
+    const quat = new a.btQuaternion(rot.x, rot.y, rot.z, rot.w)
+    tr.setIdentity()
+    tr.setOrigin(origin)
+    tr.setRotation(quat)
+    body.setWorldTransform(tr)
+    const ms = body.getMotionState?.()
+    if (ms) ms.setWorldTransform(tr)
+    body.activate?.()
+    try {
+      a.destroy(tr)
+      a.destroy(origin)
+      a.destroy(quat)
+    } catch {
+      // ignore
+    }
+  }
+
+  const makeTerrainTexture = (
+    base: string,
+    dots: Array<{ color: string; count: number; radiusMin: number; radiusMax: number; alpha: number }>,
+    strokes: Array<{ color: string; count: number; widthMin: number; widthMax: number; alpha: number }>
+  ) => {
+    const canvas = document.createElement('canvas')
+    canvas.width = 256
+    canvas.height = 256
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    ctx.fillStyle = base
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+    for (const d of dots) {
+      ctx.fillStyle = d.color
+      ctx.globalAlpha = d.alpha
+      for (let i = 0; i < d.count; i++) {
+        const x = Math.random() * canvas.width
+        const y = Math.random() * canvas.height
+        const r = d.radiusMin + Math.random() * (d.radiusMax - d.radiusMin)
+        ctx.beginPath()
+        ctx.arc(x, y, r, 0, Math.PI * 2)
+        ctx.fill()
+      }
+    }
+    for (const s of strokes) {
+      ctx.strokeStyle = s.color
+      ctx.globalAlpha = s.alpha
+      for (let i = 0; i < s.count; i++) {
+        const x = Math.random() * canvas.width
+        const y = Math.random() * canvas.height
+        const len = 12 + Math.random() * 44
+        const a = Math.random() * Math.PI * 2
+        const w = s.widthMin + Math.random() * (s.widthMax - s.widthMin)
+        ctx.lineWidth = w
+        ctx.beginPath()
+        ctx.moveTo(x, y)
+        ctx.lineTo(x + Math.cos(a) * len, y + Math.sin(a) * len)
+        ctx.stroke()
+      }
+    }
+    ctx.globalAlpha = 1
+    const tex = new THREE.CanvasTexture(canvas)
+    tex.wrapS = THREE.RepeatWrapping
+    tex.wrapT = THREE.RepeatWrapping
+    tex.colorSpace = THREE.SRGBColorSpace
+    tex.anisotropy = 8
+    return tex
+  }
+
+  const createTerrainDecorGroup = (id: TerrainId): THREE.Group => {
+    const group = new THREE.Group()
+    if (id === 'steps') {
+      const profile = terrainProfiles.find((t) => t.id === 'steps')
+      if (!profile) return group
+      for (let i = 0; i < profile.specs.length; i++) {
+        const spec = profile.specs[i]
+        const geom = new THREE.BoxGeometry(spec.halfExtents.x * 2, spec.halfExtents.y * 2, spec.halfExtents.z * 2)
+        const mat = new THREE.MeshStandardMaterial({
+          color: i % 2 === 0 ? 0xbebebe : 0xa9a9a9,
+          roughness: 0.88,
+          metalness: 0.04
+        })
+        const m = new THREE.Mesh(geom, mat)
+        m.position.copy(spec.position)
+        m.quaternion.copy(spec.rotation ?? new THREE.Quaternion())
+        group.add(m)
+      }
+      return group
+    }
+
+    const planeGeom = new THREE.PlaneGeometry(24, 24, id === 'rough' ? 80 : id === 'gravel' ? 56 : 20, id === 'rough' ? 80 : id === 'gravel' ? 56 : 20)
+    planeGeom.rotateX(-Math.PI / 2)
+    const posAttr = planeGeom.getAttribute('position') as THREE.BufferAttribute
+    for (let i = 0; i < posAttr.count; i++) {
+      const x = posAttr.getX(i)
+      const z = posAttr.getZ(i)
+      if (id === 'rough') {
+        const y = Math.sin(x * 0.75) * 0.16 + Math.cos(z * 0.64) * 0.13 + Math.sin((x + z) * 1.4) * 0.05
+        posAttr.setY(i, Math.max(-0.05, y))
+      } else if (id === 'gravel') {
+        const y = (Math.sin(x * 4.7 + z * 2.3) + Math.cos(x * 3.8 - z * 4.1)) * 0.012
+        posAttr.setY(i, y)
+      } else if (id === 'ice') {
+        const y = Math.sin((x + z) * 0.5) * 0.003
+        posAttr.setY(i, y)
+      }
+    }
+    posAttr.needsUpdate = true
+    planeGeom.computeVertexNormals()
+
+    let mat: THREE.MeshStandardMaterial
+    if (id === 'ice') {
+      const iceTex = makeTerrainTexture(
+        '#c7e6ff',
+        [{ color: '#e8f7ff', count: 850, radiusMin: 0.5, radiusMax: 2.5, alpha: 0.22 }],
+        [{ color: '#8fbad6', count: 85, widthMin: 0.5, widthMax: 1.4, alpha: 0.26 }]
+      )
+      if (iceTex) iceTex.repeat.set(6, 6)
+      mat = new THREE.MeshStandardMaterial({
+        color: 0xb7e3ff,
+        map: iceTex ?? undefined,
+        roughness: 0.08,
+        metalness: 0.1
+      })
+    } else if (id === 'gravel') {
+      const gravelTex = makeTerrainTexture(
+        '#8b7f72',
+        [
+          { color: '#746b60', count: 1900, radiusMin: 0.8, radiusMax: 2.8, alpha: 0.35 },
+          { color: '#a19484', count: 1200, radiusMin: 0.8, radiusMax: 2.5, alpha: 0.28 }
+        ],
+        [{ color: '#675e56', count: 90, widthMin: 0.4, widthMax: 1.2, alpha: 0.2 }]
+      )
+      if (gravelTex) gravelTex.repeat.set(11, 11)
+      mat = new THREE.MeshStandardMaterial({
+        color: 0x9a8d7d,
+        map: gravelTex ?? undefined,
+        roughness: 0.97,
+        metalness: 0.0
+      })
+    } else if (id === 'slope') {
+      const slopeTex = makeTerrainTexture(
+        '#9f8a6e',
+        [{ color: '#8a765f', count: 1500, radiusMin: 1.0, radiusMax: 2.8, alpha: 0.24 }],
+        [{ color: '#7e6c57', count: 120, widthMin: 1.0, widthMax: 2.2, alpha: 0.22 }]
+      )
+      if (slopeTex) slopeTex.repeat.set(7, 7)
+      mat = new THREE.MeshStandardMaterial({
+        color: 0xa8906f,
+        map: slopeTex ?? undefined,
+        roughness: 0.9,
+        metalness: 0.03
+      })
+      group.quaternion.setFromAxisAngle(new THREE.Vector3(0, 0, 1), THREE.MathUtils.degToRad(8))
+    } else if (id === 'rough') {
+      const roughTex = makeTerrainTexture(
+        '#6f7d73',
+        [
+          { color: '#5f6e65', count: 1800, radiusMin: 1.0, radiusMax: 3.2, alpha: 0.3 },
+          { color: '#8a988f', count: 1100, radiusMin: 0.8, radiusMax: 2.6, alpha: 0.24 }
+        ],
+        [{ color: '#4d5a53', count: 120, widthMin: 0.6, widthMax: 1.7, alpha: 0.2 }]
+      )
+      if (roughTex) roughTex.repeat.set(10, 10)
+      mat = new THREE.MeshStandardMaterial({
+        color: 0x718076,
+        map: roughTex ?? undefined,
+        roughness: 0.93,
+        metalness: 0.02
+      })
+    } else {
+      const flatTex = makeTerrainTexture(
+        '#e9ecef',
+        [{ color: '#d4d8dd', count: 1300, radiusMin: 0.8, radiusMax: 2.2, alpha: 0.2 }],
+        [{ color: '#f6f7f9', count: 60, widthMin: 1.2, widthMax: 2.0, alpha: 0.25 }]
+      )
+      if (flatTex) flatTex.repeat.set(8, 8)
+      mat = new THREE.MeshStandardMaterial({
+        color: 0xe7eaee,
+        map: flatTex ?? undefined,
+        roughness: 0.88,
+        metalness: 0.01
+      })
+    }
+
+    const plane = new THREE.Mesh(planeGeom, mat)
+    plane.position.y = 0.006
+    group.add(plane)
+    return group
+  }
+
+  const initTerrainBodies = () => {
+    if (!ammoWorld || !scene) return
+    terrainBodiesById.clear()
+    terrainDecorById.clear()
+    terrainVisualGroup.clear()
+    scene.add(terrainVisualGroup)
+
+    const hiddenBaseY = -220
+    let hiddenIndex = 0
+    for (const profile of terrainProfiles) {
+      const items: TerrainBodyInstance[] = []
+      for (const spec of profile.specs) {
+        const activeRot = spec.rotation ? spec.rotation.clone() : new THREE.Quaternion()
+        const hiddenPos = new THREE.Vector3(spec.position.x, hiddenBaseY - hiddenIndex * 4, spec.position.z)
+        hiddenIndex++
+        const handle = ammoWorld.createStaticBox(spec.halfExtents, hiddenPos, activeRot, {
+          friction: profile.friction,
+          restitution: profile.restitution
+        })
+        const geom = new THREE.BoxGeometry(spec.halfExtents.x * 2, spec.halfExtents.y * 2, spec.halfExtents.z * 2)
+        const mat = new THREE.MeshStandardMaterial({
+          color: spec.color,
+          roughness: 0.95,
+          metalness: 0.02
+        })
+        const mesh = new THREE.Mesh(geom, mat)
+        mesh.visible = false
+        terrainVisualGroup.add(mesh)
+        items.push({
+          handle,
+          mesh,
+          activePosition: spec.position.clone(),
+          activeRotation: activeRot,
+          hiddenPosition: hiddenPos
+        })
+      }
+      terrainBodiesById.set(profile.id, items)
+      const decor = createTerrainDecorGroup(profile.id)
+      decor.visible = false
+      terrainVisualGroup.add(decor)
+      terrainDecorById.set(profile.id, decor)
+    }
+  }
+
+  const applyTerrainById = (id: TerrainId) => {
+    if (!ammoWorld) return
+    currentTerrain = id
+    const profile = terrainProfiles.find((t) => t.id === id) ?? terrainProfiles[0]
+    terrainSpawnYOffset = profile.spawnYOffset
+    for (const [terrainId, items] of terrainBodiesById.entries()) {
+      const active = terrainId === id
+      for (const item of items) {
+        const targetPos = active ? item.activePosition : item.hiddenPosition
+        setStaticBodyPose(item.handle.body, targetPos, item.activeRotation)
+        item.mesh.visible = active && TERRAIN_PHYSICS_DEBUG_MESHES
+        if (active) {
+          item.mesh.position.copy(item.activePosition)
+          item.mesh.quaternion.copy(item.activeRotation)
+        }
+      }
+    }
+    for (const [terrainId, decor] of terrainDecorById.entries()) {
+      decor.visible = terrainId === id
+    }
+    if (baseFloorMesh) baseFloorMesh.visible = false
+    if (baseGridHelper) baseGridHelper.visible = id === 'flat'
+  }
+
+  const chooseTerrainForEpisode = (): TerrainId => {
+    if (!randomTerrainPerEpisode) return currentTerrain
+    const idx = Math.floor(Math.random() * terrainProfiles.length)
+    return terrainProfiles[idx]?.id ?? currentTerrain
+  }
+
   const disposeCurrentPhysics = () => {
+    robotIoLayer?.dispose()
+    robotIoLayer = null
     actuatorSystem?.dispose()
     actuatorSystem = null
     if (tableVisualMesh) {
@@ -845,6 +1363,34 @@ export function createWalkApp(root: HTMLDivElement) {
       ammoWorld.dispose()
       ammoWorld = null
     }
+    for (const items of terrainBodiesById.values()) {
+      for (const item of items) {
+        item.mesh.parent?.remove(item.mesh)
+        item.mesh.geometry.dispose()
+        const mat = item.mesh.material
+        if (mat instanceof THREE.Material) mat.dispose()
+      }
+    }
+    for (const decor of terrainDecorById.values()) {
+      decor.traverse((obj) => {
+        const mesh = obj as THREE.Mesh
+        if (!mesh.isMesh) return
+        const geom = mesh.geometry as THREE.BufferGeometry | undefined
+        if (geom) geom.dispose()
+        const mat = mesh.material
+        if (Array.isArray(mat)) {
+          for (const m of mat) m.dispose()
+        } else if (mat instanceof THREE.Material) {
+          const maybeMap = (mat as THREE.MeshStandardMaterial).map
+          maybeMap?.dispose()
+          mat.dispose()
+        }
+      })
+      decor.parent?.remove(decor)
+    }
+    terrainBodiesById.clear()
+    terrainDecorById.clear()
+    terrainVisualGroup.clear()
     if (meshGeometry) {
       meshGeometry.dispose()
       meshGeometry = null
@@ -901,6 +1447,121 @@ export function createWalkApp(root: HTMLDivElement) {
     return g && g.amplitudes.length === actuatorCount ? g : null
   }
 
+  const isFiniteNumberArray = (value: unknown): value is number[] =>
+    Array.isArray(value) && value.every((x) => typeof x === 'number' && Number.isFinite(x))
+
+  const isFigureId = (value: unknown): value is FigureId =>
+    value === 'table' ||
+    value === 'stool' ||
+    value === 'bench' ||
+    value === 'spider' ||
+    value === 'turtle' ||
+    value === 'beetle' ||
+    value === 'crab' ||
+    value === 'rocket'
+
+  const isTrainingAlgorithmId = (value: unknown): value is TrainingAlgorithmId =>
+    value === 'evolution' || value === 'cmaes' || value === 'de' || value === 'pso' || value === 'cem'
+
+  const isRobotBackendId = (value: unknown): value is RobotBackendId =>
+    value === 'sim' || value === 'hardware-websocket'
+
+  const isTerrainId = (value: unknown): value is TerrainId =>
+    value === 'flat' || value === 'ice' || value === 'gravel' || value === 'slope' || value === 'steps' || value === 'rough'
+
+  const sanitizeGenomeLengths = (genome: Genome, actuatorCount: number): Genome | null => {
+    if (
+      genome.amplitudes.length !== actuatorCount ||
+      genome.omegas.length !== actuatorCount ||
+      genome.phases.length !== actuatorCount
+    ) {
+      return null
+    }
+    const clamp = (x: number, min: number, max: number) => Math.max(min, Math.min(max, x))
+    return {
+      amplitudes: genome.amplitudes.map((x) => clamp(x, 0.0, 0.22)),
+      omegas: genome.omegas.map((x) => clamp(x, 0.2, 8.5)),
+      phases: genome.phases.slice()
+    }
+  }
+
+  const parsePolicySnapshot = (raw: string): PolicySnapshot => {
+    const payload = JSON.parse(raw) as Partial<PolicySnapshot>
+    if (!payload || typeof payload !== 'object') throw new Error('JSON должен быть объектом')
+    if (!isTrainingAlgorithmId(payload.algorithm)) throw new Error('Некорректный algorithm')
+    if (!isFigureId(payload.figure)) throw new Error('Некорректный figure')
+    if (typeof payload.trainingGenerations !== 'number' || !Number.isFinite(payload.trainingGenerations)) {
+      throw new Error('Некорректный trainingGenerations')
+    }
+    if (typeof payload.elasticitySlider !== 'number' || !Number.isFinite(payload.elasticitySlider)) {
+      throw new Error('Некорректный elasticitySlider')
+    }
+    if (typeof payload.showActuatorSpheres !== 'boolean') throw new Error('Некорректный showActuatorSpheres')
+    const terrain = isTerrainId(payload.terrain) ? payload.terrain : 'flat'
+    const randomTerrainPerEpisode =
+      typeof payload.randomTerrainPerEpisode === 'boolean' ? payload.randomTerrainPerEpisode : false
+    const robotBackend = isRobotBackendId(payload.robotBackend) ? payload.robotBackend : 'sim'
+    const robotWsUrl = typeof payload.robotWsUrl === 'string' ? payload.robotWsUrl : 'ws://localhost:8765'
+    const g = payload.genome
+    if (!g || !isFiniteNumberArray(g.amplitudes) || !isFiniteNumberArray(g.omegas) || !isFiniteNumberArray(g.phases)) {
+      throw new Error('Некорректный genome')
+    }
+    return {
+      version: typeof payload.version === 'number' ? payload.version : 0,
+      createdAt: typeof payload.createdAt === 'string' ? payload.createdAt : new Date().toISOString(),
+      algorithm: payload.algorithm,
+      figure: payload.figure,
+      trainingGenerations: payload.trainingGenerations,
+      elasticitySlider: payload.elasticitySlider,
+      showActuatorSpheres: payload.showActuatorSpheres,
+      terrain,
+      randomTerrainPerEpisode,
+      robotBackend,
+      robotWsUrl,
+      genome: {
+        amplitudes: g.amplitudes.slice(),
+        omegas: g.omegas.slice(),
+        phases: g.phases.slice()
+      }
+    }
+  }
+
+  const buildPolicySnapshot = (): PolicySnapshot | null => {
+    const actuatorCount = footPivotsLocal.length
+    if (!previewGenome || actuatorCount <= 0) return null
+    const sanitized = sanitizeGenomeLengths(previewGenome, actuatorCount)
+    if (!sanitized) return null
+    return {
+      version: POLICY_FILE_VERSION,
+      createdAt: new Date().toISOString(),
+      algorithm: selectedTrainingAlgorithm(),
+      figure: currentFigure,
+      trainingGenerations: readTrainingGenerations(),
+      elasticitySlider,
+      showActuatorSpheres,
+      terrain: currentTerrain,
+      randomTerrainPerEpisode,
+      robotBackend: (robotBackendEl.value as RobotBackendId) || 'sim',
+      robotWsUrl: robotWsUrlEl.value.trim() || 'ws://localhost:8765',
+      genome: sanitized
+    }
+  }
+
+  const triggerPolicyDownload = (snapshot: PolicySnapshot) => {
+    const body = `${JSON.stringify(snapshot, null, 2)}\n`
+    const blob = new Blob([body], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const stamp = snapshot.createdAt.replace(/[:.]/g, '-')
+    const fileName = `walking-policy-${snapshot.figure}-${snapshot.algorithm}-${stamp}.json`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = fileName
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  }
+
   const drawRewardChart = () => {
     const ctx = rewardChart.getContext('2d')
     if (!ctx) return
@@ -941,6 +1602,108 @@ export function createWalkApp(root: HTMLDivElement) {
     ctx.fillStyle = 'rgba(255,255,255,0.8)'
     ctx.font = '11px ui-monospace, Menlo, monospace'
     ctx.fillText(`best: ${rewardHistory[rewardHistory.length - 1].toFixed(3)}`, 8, h - 4)
+  }
+
+  const rebuildCalibrationJointSelect = () => {
+    calibJointEl.innerHTML = ''
+    const count = footPivotsLocal.length
+    for (let i = 0; i < count; i++) {
+      const o = document.createElement('option')
+      o.value = String(i)
+      o.textContent = `leg-${i}`
+      calibJointEl.appendChild(o)
+    }
+    if (count > 0) calibJointEl.value = '0'
+  }
+
+  const pushCalibrationSample = (cmdPos: number, measPos: number | null) => {
+    calibCmdHistory.push(cmdPos)
+    calibMeasHistory.push(measPos ?? cmdPos)
+    const maxN = 180
+    if (calibCmdHistory.length > maxN) calibCmdHistory.splice(0, calibCmdHistory.length - maxN)
+    if (calibMeasHistory.length > maxN) calibMeasHistory.splice(0, calibMeasHistory.length - maxN)
+  }
+
+  const drawCalibrationChart = () => {
+    const ctx = calibChart.getContext('2d')
+    if (!ctx) return
+    const w = calibChart.width
+    const h = calibChart.height
+    ctx.clearRect(0, 0, w, h)
+    ctx.fillStyle = 'rgba(20,20,20,0.03)'
+    ctx.fillRect(0, 0, w, h)
+    ctx.strokeStyle = 'rgba(100,100,100,0.18)'
+    ctx.beginPath()
+    ctx.moveTo(6, h * 0.5)
+    ctx.lineTo(w - 6, h * 0.5)
+    ctx.stroke()
+    const n = Math.min(calibCmdHistory.length, calibMeasHistory.length)
+    if (n < 2) {
+      ctx.fillStyle = 'rgba(80,80,80,0.8)'
+      ctx.font = '11px ui-monospace, Menlo, monospace'
+      ctx.fillText('Calibration: command vs measured', 8, 16)
+      return
+    }
+    const all = calibCmdHistory.concat(calibMeasHistory)
+    const min = Math.min(...all)
+    const max = Math.max(...all)
+    const r = Math.max(1e-6, max - min)
+    const x = (i: number) => 8 + (i / (n - 1)) * (w - 16)
+    const y = (v: number) => (1 - (v - min) / r) * (h - 14) + 7
+    ctx.lineWidth = 1.8
+    ctx.strokeStyle = '#2d8cff'
+    ctx.beginPath()
+    ctx.moveTo(x(0), y(calibCmdHistory[0]!))
+    for (let i = 1; i < n; i++) ctx.lineTo(x(i), y(calibCmdHistory[i]!))
+    ctx.stroke()
+    ctx.strokeStyle = '#f97316'
+    ctx.beginPath()
+    ctx.moveTo(x(0), y(calibMeasHistory[0]!))
+    for (let i = 1; i < n; i++) ctx.lineTo(x(i), y(calibMeasHistory[i]!))
+    ctx.stroke()
+  }
+
+  const measuredJointPosition = (idx: number): number | null => {
+    const t = robotIoLayer?.getLatestTelemetry()
+    const js = t?.jointState
+    if (!js?.name || !js?.position) return null
+    const desired = `leg-${idx}`
+    const i = js.name.indexOf(desired)
+    if (i >= 0 && i < js.position.length) return js.position[i] ?? null
+    return idx < js.position.length ? js.position[idx] ?? null : null
+  }
+
+  const escapeYaml = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+
+  const triggerCalibratedYamlDownload = () => {
+    const lines: string[] = []
+    lines.push(`generatedAt: "${escapeYaml(calibrationYamlObject.generatedAt)}"`)
+    lines.push(`robotBackend: "${escapeYaml(calibrationYamlObject.robotBackend)}"`)
+    lines.push(`robotWsUrl: "${escapeYaml(calibrationYamlObject.robotWsUrl)}"`)
+    lines.push('joints:')
+    for (const j of calibrationYamlObject.joints) {
+      lines.push(`  - input: ${j.input}`)
+      lines.push(`    output_name: ${j.output_name}`)
+      lines.push(`    output_id: ${j.output_id}`)
+      lines.push(`    sign: ${j.sign.toFixed(6)}`)
+      lines.push(`    scale: ${j.scale.toFixed(6)}`)
+      lines.push(`    position_offset: ${j.position_offset.toFixed(6)}`)
+      lines.push('    limits:')
+      lines.push(`      position_min: ${j.limits.position_min.toFixed(6)}`)
+      lines.push(`      position_max: ${j.limits.position_max.toFixed(6)}`)
+      lines.push(`      velocity_abs_max: ${j.limits.velocity_abs_max.toFixed(6)}`)
+      lines.push(`      effort_abs_max: ${j.limits.effort_abs_max.toFixed(6)}`)
+    }
+    const body = `${lines.join('\n')}\n`
+    const blob = new Blob([body], { type: 'text/yaml' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `joint_mapping.calibrated.${new Date().toISOString().replace(/[:.]/g, '-')}.yaml`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
   }
 
   const yieldToUI = () => new Promise<void>((r) => setTimeout(r, 0))
@@ -985,6 +1748,27 @@ export function createWalkApp(root: HTMLDivElement) {
     }
     sys.setGenome(previewGenome)
     actuatorSystem = sys
+    robotIoLayer?.dispose()
+    robotIoLayer = new RobotIoLayer(sys)
+    robotIoLayer.setBackend((robotBackendEl.value as RobotBackendId) || 'sim', robotWsUrlEl.value)
+    rebuildCalibrationJointSelect()
+    calibrationYamlObject.generatedAt = new Date().toISOString()
+    calibrationYamlObject.robotBackend = (robotBackendEl.value as RobotBackendId) || 'sim'
+    calibrationYamlObject.robotWsUrl = robotWsUrlEl.value.trim() || 'ws://localhost:8765'
+    calibrationYamlObject.joints = Array.from({ length: footPivotsLocal.length }, (_, i) => ({
+      input: `leg-${i}`,
+      output_name: `joint_${i}`,
+      output_id: i + 1,
+      sign: 1,
+      scale: 1,
+      position_offset: 0,
+      limits: {
+        position_min: -1.2,
+        position_max: 1.2,
+        velocity_abs_max: 4.0,
+        effort_abs_max: 18.0
+      }
+    }))
     syncElasticityFromSlider()
     syncActuatorSphereVisibility()
     return sys
@@ -1003,7 +1787,8 @@ export function createWalkApp(root: HTMLDivElement) {
     footOutwardLocal = footOutwardDirsXZ(footPivotsLocal)
 
     ammoWorld = new AmmoWorld(ammo, { gravityY: -9.8, solverIterations: 44 })
-    ammoWorld.createGround(20, 20, 0)
+    initTerrainBodies()
+    applyTerrainById(currentTerrain)
     tableResetPool = createRigidBodyResetPool(ammoWorld.ammo)
 
     const flat = geometryPositionsFlat(meshGeometry)
@@ -1027,7 +1812,7 @@ export function createWalkApp(root: HTMLDivElement) {
 
     simTimeSeconds = 0
     setStatus(
-      `Симуляция выключена — «Запустить». ${figureLabel(currentFigure)}, приводов: ${footPivotsLocal.length}.`
+      `Симуляция выключена — «Запустить». ${figureLabel(currentFigure)}, terrain: ${terrainLabel(currentTerrain)}, приводов: ${footPivotsLocal.length}.`
     )
     if (currentFigure === 'spider' && !spiderObjGeometryTemplate) {
       const why = spiderObjLastError ? ` (${spiderObjLastError})` : ''
@@ -1038,15 +1823,24 @@ export function createWalkApp(root: HTMLDivElement) {
     updateSimControlButtons()
   }
 
-  const resetSimulationForEpisode = (genome?: Genome) => {
+  const resetSimulationForEpisode = (genome?: Genome, randomizeTerrain = false) => {
     if (!ammoWorld || !tableRigidBody || !tableResetPool || !actuatorSystem) {
       throw new Error('Физика не инициализирована')
     }
-    resetRigidBodyToPose(tableRigidBody, initialTablePos, initialTableQuat, tableResetPool)
+    if (randomizeTerrain) {
+      applyTerrainById(chooseTerrainForEpisode())
+    }
+    resetPosePos.copy(initialTablePos)
+    resetPosePos.y += terrainSpawnYOffset
+    resetRigidBodyToPose(tableRigidBody, resetPosePos, initialTableQuat, tableResetPool)
     if (genome) previewGenome = genome
     if (!previewGenome) previewGenome = randomGenome(footPivotsLocal.length)
     actuatorSystem.setGenome(previewGenome)
-    actuatorSystem.applyAtTime(0)
+    if (previewGenome && robotIoLayer) {
+      robotIoLayer.tick(previewGenome, 0, tableRigidBody)
+    } else {
+      actuatorSystem.applyAtTime(0)
+    }
     if (tableVisualMesh) syncMeshFromRigidBody(tableVisualMesh, tableRigidBody)
     applyVisualLegFlex()
     simTimeSeconds = 0
@@ -1088,10 +1882,12 @@ export function createWalkApp(root: HTMLDivElement) {
     floor.rotation.x = -Math.PI / 2
     floor.position.y = floorY
     scene.add(floor)
+    baseFloorMesh = floor
 
     const grid = new THREE.GridHelper(24, 48, 0xcbd5e1, 0xe2e8f0)
     grid.position.y = 0.004
     scene.add(grid)
+    baseGridHelper = grid
 
     window.addEventListener('resize', () => {
       camera.aspect = window.innerWidth / window.innerHeight
@@ -1105,7 +1901,11 @@ export function createWalkApp(root: HTMLDivElement) {
     requestAnimationFrame(animate)
     const dt = 1 / 60
     if (ammoWorld && tableRigidBody && tableVisualMesh && isPlaying && !externalStepping) {
-      actuatorSystem?.applyAtTime(simTimeSeconds)
+      if (previewGenome && robotIoLayer) {
+        robotIoLayer.tick(previewGenome, simTimeSeconds, tableRigidBody)
+      } else {
+        actuatorSystem?.applyAtTime(simTimeSeconds)
+      }
       ammoWorld.step(dt, 32)
       syncMeshFromRigidBody(tableVisualMesh, tableRigidBody)
       applyVisualLegFlex()
@@ -1119,13 +1919,35 @@ export function createWalkApp(root: HTMLDivElement) {
         setStatus(`Авто-стоп: обнаружен откат назад (progress=${progressX.toFixed(3)}).`)
       }
     }
+    if (ammoWorld && tableRigidBody && identificationActive && !externalStepping) {
+      const localT = simTimeSeconds - identificationStartTime
+      const cmd: MotorCommand[] = Array.from({ length: footPivotsLocal.length }, (_, i) => ({
+        jointId: `leg-${i}`,
+        index: i,
+        targetPosition: i === identificationJointIdx ? 0.18 * Math.sin(localT * 2.4) : 0,
+        targetVelocity: i === identificationJointIdx ? 0.18 * 2.4 * Math.cos(localT * 2.4) : 0,
+        targetEffort: i === identificationJointIdx ? 8.0 * Math.sin(localT * 2.4) : 0
+      }))
+      robotIoLayer?.sendManualCommands(cmd, tableRigidBody, simTimeSeconds)
+      ammoWorld.step(dt, 32)
+      if (tableVisualMesh) syncMeshFromRigidBody(tableVisualMesh, tableRigidBody)
+      applyVisualLegFlex()
+      simTimeSeconds += dt
+      const meas = measuredJointPosition(identificationJointIdx)
+      pushCalibrationSample(cmd[identificationJointIdx]!.targetPosition, meas)
+    }
+    drawCalibrationChart()
     controls.update()
     renderer.render(scene, camera)
   }
 
   const stepPreviewOnce = (dtSeconds: number) => {
     if (!ammoWorld || !tableRigidBody || !tableVisualMesh) return
-    actuatorSystem?.applyAtTime(simTimeSeconds)
+    if (previewGenome && robotIoLayer) {
+      robotIoLayer.tick(previewGenome, simTimeSeconds, tableRigidBody)
+    } else {
+      actuatorSystem?.applyAtTime(simTimeSeconds)
+    }
     ammoWorld.step(dtSeconds, 32)
     syncMeshFromRigidBody(tableVisualMesh, tableRigidBody)
     applyVisualLegFlex()
@@ -1137,7 +1959,7 @@ export function createWalkApp(root: HTMLDivElement) {
     externalStepping = true
     isPlaying = false
     updateSimControlButtons()
-    resetSimulationForEpisode(genome)
+    resetSimulationForEpisode(genome, true)
     if (!tableRigidBody) throw new Error('Missing rigid table')
 
     const reward = new RewardCalculator({
@@ -1209,7 +2031,7 @@ export function createWalkApp(root: HTMLDivElement) {
       evalSteps: number,
       minWindowProgress: number
     ): Promise<number> => {
-      resetSimulationForEpisode(genome)
+      resetSimulationForEpisode(genome, true)
       // Multi-seed surrogate: vary initial phase/time offset for robustness.
       simTimeSeconds = (rolloutIndex / Math.max(1, rolloutCount)) * 0.45
 
@@ -1228,7 +2050,11 @@ export function createWalkApp(root: HTMLDivElement) {
       let bestProgress = 0
 
       for (let step = 0; step < evalSteps; step++) {
-        actuatorSystem?.applyAtTime(simTimeSeconds)
+        if (previewGenome && robotIoLayer) {
+          robotIoLayer.tick(previewGenome, simTimeSeconds, tableRigidBody!)
+        } else {
+          actuatorSystem?.applyAtTime(simTimeSeconds)
+        }
         ammoWorld!.step(dt, 32)
         reward.observeRigidStep(tableRigidBody!)
         simTimeSeconds += dt
@@ -1361,6 +2187,8 @@ export function createWalkApp(root: HTMLDivElement) {
     }
     ammo = await ammoGlobal()
     currentFigure = (figureTypeEl.value as FigureId) || 'table'
+    currentTerrain = (terrainTypeEl.value as TerrainId) || 'flat'
+    randomTerrainPerEpisode = terrainRandomEpisodesEl.checked
     await rebuildFigure(currentFigure)
     drawRewardChart()
     animate()
@@ -1368,6 +2196,108 @@ export function createWalkApp(root: HTMLDivElement) {
     figureTypeEl.addEventListener('change', async () => {
       const next = (figureTypeEl.value as FigureId) || 'table'
       await rebuildFigure(next)
+    })
+
+    terrainTypeEl.addEventListener('change', () => {
+      const next = (terrainTypeEl.value as TerrainId) || 'flat'
+      currentTerrain = next
+      applyTerrainById(next)
+      if (ammoWorld && tableRigidBody && tableResetPool && actuatorSystem && previewGenome) {
+        resetSimulationForEpisode(previewGenome)
+      }
+      setStatus(`Terrain Lab: ${terrainLabel(currentTerrain)}.`)
+    })
+
+    terrainRandomEpisodesEl.addEventListener('change', () => {
+      randomTerrainPerEpisode = terrainRandomEpisodesEl.checked
+      setStatus(
+        randomTerrainPerEpisode
+          ? 'Terrain Lab: случайный выбор покрытия на каждом эпизоде включен.'
+          : `Terrain Lab: фиксированное покрытие (${terrainLabel(currentTerrain)}).`
+      )
+    })
+
+    robotBackendEl.addEventListener('change', () => {
+      const backend = (robotBackendEl.value as RobotBackendId) || 'sim'
+      const endpoint = robotWsUrlEl.value.trim() || 'ws://localhost:8765'
+      robotIoLayer?.setBackend(backend, endpoint)
+      setStatus(
+        backend === 'sim'
+          ? 'Robot I/O: sim backend активен.'
+          : `Robot I/O: hardware backend (WebSocket) активен, endpoint=${endpoint}.`
+      )
+    })
+
+    robotWsUrlEl.addEventListener('change', () => {
+      const backend = (robotBackendEl.value as RobotBackendId) || 'sim'
+      const endpoint = robotWsUrlEl.value.trim() || 'ws://localhost:8765'
+      if (backend === 'hardware-websocket') {
+        robotIoLayer?.setBackend(backend, endpoint)
+        setStatus(`Robot I/O: подключение hardware backend к ${endpoint}.`)
+      }
+    })
+
+    identifyJointBtn.addEventListener('click', () => {
+      if (!tableRigidBody || !robotIoLayer) {
+        setStatus('Identification недоступен: физика/Robot I/O не готовы.')
+        return
+      }
+      const idx = Number.parseInt(calibJointEl.value || '0', 10)
+      identificationJointIdx = Number.isFinite(idx) ? Math.max(0, Math.min(footPivotsLocal.length - 1, idx)) : 0
+      identificationStartTime = simTimeSeconds
+      identificationActive = !identificationActive
+      if (identificationActive) {
+        isPlaying = false
+        updateSimControlButtons()
+      }
+      setStatus(
+        identificationActive
+          ? `Identification: auto-режим leg-${identificationJointIdx} активен.`
+          : 'Identification остановлен.'
+      )
+    })
+
+    calibStepZeroBtn.addEventListener('click', () => {
+      const idx = Number.parseInt(calibJointEl.value || '0', 10)
+      const samples = calibMeasHistory.slice(-50)
+      const mean = samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : 0
+      if (idx >= 0 && idx < calibrationYamlObject.joints.length) {
+        calibrationYamlObject.joints[idx]!.position_offset = -mean
+      }
+      setStatus(`Calibration step 1 (zero): leg-${idx}, offset=${(-mean).toFixed(4)}.`)
+    })
+
+    calibStepDirectionBtn.addEventListener('click', () => {
+      const idx = Number.parseInt(calibJointEl.value || '0', 10)
+      let corr = 0
+      for (let i = 1; i < Math.min(calibCmdHistory.length, calibMeasHistory.length); i++) {
+        corr += (calibCmdHistory[i]! - calibCmdHistory[i - 1]!) * (calibMeasHistory[i]! - calibMeasHistory[i - 1]!)
+      }
+      const sign = corr >= 0 ? 1 : -1
+      if (idx >= 0 && idx < calibrationYamlObject.joints.length) {
+        calibrationYamlObject.joints[idx]!.sign = sign
+      }
+      setStatus(`Calibration step 2 (direction): leg-${idx}, sign=${sign}.`)
+    })
+
+    calibStepLimitsBtn.addEventListener('click', () => {
+      const idx = Number.parseInt(calibJointEl.value || '0', 10)
+      const samples = calibMeasHistory.slice(-120)
+      const min = samples.length ? Math.min(...samples) : -1
+      const max = samples.length ? Math.max(...samples) : 1
+      if (idx >= 0 && idx < calibrationYamlObject.joints.length) {
+        calibrationYamlObject.joints[idx]!.limits.position_min = min - 0.04
+        calibrationYamlObject.joints[idx]!.limits.position_max = max + 0.04
+      }
+      setStatus(`Calibration step 3 (limits): leg-${idx}, [${(min - 0.04).toFixed(3)}, ${(max + 0.04).toFixed(3)}].`)
+    })
+
+    calibSaveYamlBtn.addEventListener('click', () => {
+      calibrationYamlObject.generatedAt = new Date().toISOString()
+      calibrationYamlObject.robotBackend = (robotBackendEl.value as RobotBackendId) || 'sim'
+      calibrationYamlObject.robotWsUrl = robotWsUrlEl.value.trim() || 'ws://localhost:8765'
+      triggerCalibratedYamlDownload()
+      setStatus('Calibration YAML сохранен.')
     })
 
     trainAlgorithmEl.addEventListener('change', () => {
@@ -1381,10 +2311,15 @@ export function createWalkApp(root: HTMLDivElement) {
 
     trainStartBtn.addEventListener('click', async () => {
       if (!ammo || !meshGeometry) return
+      identificationActive = false
       trainStartBtn.disabled = true
       trainGenerationsEl.disabled = true
       trainAlgorithmEl.disabled = true
       figureTypeEl.disabled = true
+      terrainTypeEl.disabled = true
+      terrainRandomEpisodesEl.disabled = true
+      robotBackendEl.disabled = true
+      robotWsUrlEl.disabled = true
       try {
         await runTraining()
       } finally {
@@ -1392,6 +2327,93 @@ export function createWalkApp(root: HTMLDivElement) {
         trainGenerationsEl.disabled = false
         trainAlgorithmEl.disabled = false
         trainStartBtn.disabled = false
+        terrainTypeEl.disabled = false
+        terrainRandomEpisodesEl.disabled = false
+        robotBackendEl.disabled = false
+        robotWsUrlEl.disabled = false
+      }
+    })
+
+    policySaveBtn.addEventListener('click', () => {
+      const snapshot = buildPolicySnapshot()
+      if (!snapshot) {
+        setStatus('Не удалось сохранить: политика еще не инициализирована.')
+        return
+      }
+      triggerPolicyDownload(snapshot)
+      setStatus(
+        `Политика сохранена в JSON (${figureLabel(snapshot.figure)}, ${snapshot.algorithm}, приводов: ${snapshot.genome.amplitudes.length}).`
+      )
+    })
+
+    policyLoadBtn.addEventListener('click', () => {
+      policyFileInput.value = ''
+      policyFileInput.click()
+    })
+
+    policyFileInput.addEventListener('change', async () => {
+      const file = policyFileInput.files?.[0]
+      if (!file) return
+      try {
+        const text = await file.text()
+        const snapshot = parsePolicySnapshot(text)
+        if (snapshot.version > POLICY_FILE_VERSION) {
+          throw new Error(`Версия policy v${snapshot.version} не поддерживается этой сборкой`)
+        }
+
+        if (figureTypeEl.value !== snapshot.figure) {
+          figureTypeEl.value = snapshot.figure
+          await rebuildFigure(snapshot.figure)
+        } else if (!ammoWorld || !tableRigidBody || !actuatorSystem) {
+          await rebuildFigure(snapshot.figure)
+        }
+
+        const expectedActuators = footPivotsLocal.length
+        const genome = sanitizeGenomeLengths(snapshot.genome, expectedActuators)
+        if (!genome) {
+          throw new Error(
+            `Genome из файла не подходит: в файле ${snapshot.genome.amplitudes.length} приводов, у фигуры ${expectedActuators}`
+          )
+        }
+
+        trainAlgorithmEl.value = snapshot.algorithm
+        trainGenerationsEl.value = String(
+          Math.min(TRAINING_GENERATIONS_MAX, Math.max(TRAINING_GENERATIONS_MIN, Math.round(snapshot.trainingGenerations)))
+        )
+
+        const flexMax = Number.parseFloat(flexGainEl.max)
+        const flexMin = Number.parseFloat(flexGainEl.min)
+        elasticitySlider = Math.min(flexMax, Math.max(flexMin, snapshot.elasticitySlider))
+        flexGainEl.value = elasticitySlider.toFixed(3)
+        flexGainValEl.textContent = elasticitySlider.toFixed(3)
+
+        showActuatorSpheres = snapshot.showActuatorSpheres
+        sphereVizEl.value = showActuatorSpheres ? '1' : '0'
+        sphereVizValEl.textContent = showActuatorSpheres ? 'вкл' : 'выкл'
+
+        currentTerrain = snapshot.terrain
+        randomTerrainPerEpisode = snapshot.randomTerrainPerEpisode
+        terrainTypeEl.value = currentTerrain
+        terrainRandomEpisodesEl.checked = randomTerrainPerEpisode
+        applyTerrainById(currentTerrain)
+
+        robotBackendEl.value = snapshot.robotBackend
+        robotWsUrlEl.value = snapshot.robotWsUrl
+        robotIoLayer?.setBackend(snapshot.robotBackend, snapshot.robotWsUrl)
+        calibrationYamlObject.robotBackend = snapshot.robotBackend
+        calibrationYamlObject.robotWsUrl = snapshot.robotWsUrl
+
+        previewGenome = genome
+        if (ammoWorld && tableRigidBody && tableResetPool && actuatorSystem) {
+          resetSimulationForEpisode(previewGenome)
+        }
+        syncElasticityFromSlider()
+        syncActuatorSphereVisibility()
+        setStatus(
+          `Политика загружена из JSON (${figureLabel(snapshot.figure)}, ${snapshot.algorithm}, приводов: ${genome.amplitudes.length}).`
+        )
+      } catch (e) {
+        setStatus(`Ошибка загрузки policy JSON: ${(e as Error).message}`)
       }
     })
   }

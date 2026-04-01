@@ -1,0 +1,41 @@
+watchdog_timeout_sec: 0.35
+
+default_limits:
+  position_min: -1.2
+  position_max: 1.2
+  velocity_abs_max: 4.0
+  effort_abs_max: 18.0
+
+joints:
+  - input: leg-0
+    output_name: front_left_hip
+    output_id: 1
+    sign: 1.0
+    scale: 1.0
+    position_offset: 0.0
+    limits:
+      position_min: -1.0
+      position_max: 1.0
+      velocity_abs_max: 5.0
+      effort_abs_max: 16.0
+
+  - input: leg-1
+    output_name: front_right_hip
+    output_id: 2
+    sign: -1.0
+    scale: 1.0
+    position_offset: 0.0
+
+  - input: leg-2
+    output_name: rear_left_hip
+    output_id: 3
+    sign: 1.0
+    scale: 1.0
+    position_offset: 0.0
+
+  - input: leg-3
+    output_name: rear_right_hip
+    output_id: 4
+    sign: -1.0
+    scale: 1.0
+    position_offset: 0.0
